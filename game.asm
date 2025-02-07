@@ -158,9 +158,13 @@ frame_start: ; the main game loop hell yeah
   and #$01 ; right
   beq :+
   inc goomba_x_vel
+  inc goomba_x_vel
+  inc goomba_x_vel
 : lda controller
   and #$02 ; left
   beq :+
+  dec goomba_x_vel
+  dec goomba_x_vel
   dec goomba_x_vel
 :
 
