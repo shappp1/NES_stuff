@@ -1,3 +1,5 @@
+.feature force_range
+
 .segment "HEADER"
 .byte "NES",$1a,$02,$01,$00,$08
 
@@ -5,19 +7,23 @@
 .addr vblank,reset,irq
 
 .segment "ZEROPAGE"
-frame_timer: .res 1
-frame_complete: .res 1
+frame_counter: .res 1 ; increments each frame
+processing_complete: .res 1 ; 0 if frame hasn't finished processing, 1 if it has
 
-goomba_x_pos: .res 2
-goomba_y_pos: .res 2
-goomba_x_vel: .res 1
-goomba_y_vel: .res 1
+; M = sign, P = pixels, S = subpixels (16 sp/p)
+goomba_x_pos: .res 2 ; 0000PPPP PPPPSSSS
+goomba_y_pos: .res 2 ; 0000PPPP PPPPSSSS
+goomba_x_vel: .res 1 ; MPPP SSSS
+goomba_y_vel: .res 1 ; MPPP SSSS
+goomba_in_air: .res 1
+
+; 11111111 11000000
 
 controller: .res 1
 
 .code
 vblank:
-  lda frame_complete
+  lda processing_complete
   beq irq
 
   lda #$00
@@ -29,10 +35,10 @@ vblank:
   sta $2005
   sta $2005
   
-  inc frame_timer
-  inc frame_complete
+  dec processing_complete
 irq: rti
 
+; modifies a and x, returns controller bits in controller address
 .proc ReadController
   ldx #$01
   stx controller
@@ -49,6 +55,20 @@ irq: rti
   rts
 .endproc
 
+; a = pos low byte, x = pos high byte, returns pos in pixels in a, also modifies y
+.proc GetPosPixels
+  and #$F0
+  ora #$08 ; carry flag will be set after 4 shifts
+: tay
+  txa
+  lsr a
+  tax
+  tya
+  ror a
+  bcc :-
+  rts
+.endproc
+
 reset:
   sei ; ignore interrupts
   cld ; disable decimal mode
@@ -57,11 +77,11 @@ reset:
   ldx #$FF
   txs ; set stack pointer
   inx
-  stx $2000 ; clear PPUCTRL register
-  stx $2001 ; clear PPUMASK register
+  stx $2000 ; disable NMI (in case PPU not reset to power up state)
+  stx $2001 ; disable rendering (in case PPU not reset to power up state)
   stx $4010 ; disable PCM
-  stx frame_timer
-  stx frame_complete
+  stx frame_counter
+  stx processing_complete
 
   bit $2002
 : bit $2002 ; wait for vblank
@@ -80,9 +100,18 @@ reset:
   inx
   bne :-
 
-: bit $2002 ; wait for vblank
+  ; load sprites into OAM
+  ldx #$00
+: lda sprite,x
+  sta $0200,x
+  inx
+  cpx #sprite_end
+  bne :-
+
+: bit $2002 ; wait for vblank (PPU should be ready after)
   bpl :-
 
+  ; load palette data (woah really)
   lda #$3F
   sta $2006
   lda #$00
@@ -94,6 +123,7 @@ reset:
   cpx #$20
   bne :-
 
+  ; fill first nametable with zero
   lda #$20
   sta $2006
   lda #$00
@@ -106,6 +136,7 @@ reset:
   dey
   bne :-
 
+; loads ground into first nametable
   lda #$23
   sta $2006
   lda #$40
@@ -120,30 +151,30 @@ reset:
   dey
   bne :--
 
-  ldx #$00
-: lda sprite,x
-  sta $0200,x
-  inx
-  cpx #sprite_end
-  bne :-
-
   cli
   lda #$90
-  sta $2000
+  sta $2000 ; could call NMI immediately but processing_complete will be 0
   lda #$1E
   sta $2001
 
-  lda #$10
+  lda #$01
+  sta goomba_x_pos+1
+  lda #$0C
+  sta goomba_y_pos+1
+  lda #$00
   sta goomba_x_pos
-  lda #$C0
   sta goomba_y_pos
 
-; convention: always jmp to frame_start and frame_end
-frame_start: ; the main game loop hell yeah
-  lda frame_timer
-  and #$0F
+;; CONSTANTS
+GOOMBA_X_VEL = $28 ; 2.5 px/f
+GOOMBA_JUMP_VEL = -$50 ; 4.0 px/f
+GOOMBA_Y_ACC = $04 ; 0.0625 px/f^2
+
+frame_start:
+  lda frame_counter
+  and #$0F ; swap legs every 16 frames
   bne :+
-  ; swap OAM[9] and OAM[13]
+  ; swap OAM[9] and OAM[13] (goomba leg positions)
   lda $0209
   ldx $020D
   stx $0209
@@ -151,29 +182,85 @@ frame_start: ; the main game loop hell yeah
 :
   jsr ReadController
 
-  lda #$00
-  sta goomba_x_vel
-
+  ; handle x velocity
+  ldx #$00
   lda controller
   and #$01 ; right
   beq :+
-  inc goomba_x_vel
-  inc goomba_x_vel
-  inc goomba_x_vel
+  txa
+  clc
+  adc #GOOMBA_X_VEL
+  tax
 : lda controller
   and #$02 ; left
   beq :+
-  dec goomba_x_vel
-  dec goomba_x_vel
-  dec goomba_x_vel
+  txa
+  sec
+  sbc #GOOMBA_X_VEL
+  tax
+:
+  stx goomba_x_vel
+
+  ; handle jump
+  lda goomba_in_air
+  bne :+
+  lda controller
+  and #$08 ; up
+  beq :+
+  lda #GOOMBA_JUMP_VEL
+  sta goomba_y_vel
+  inc goomba_in_air
+:
+  ; handle gravity
+  lda goomba_y_vel
+  clc
+  adc #GOOMBA_Y_ACC
+  bvc :+ ; prohibit velocity from overflowing
+  lda #$7F
+: sta goomba_y_vel
+
+  ; add x velocity to position
+  lda goomba_x_vel
+  clc
+  adc goomba_x_pos
+  sta goomba_x_pos
+  lda goomba_x_vel ; sign extend velocity
+  and #$80
+  bpl :+
+  lda #$FF
+: adc goomba_x_pos+1
+  sta goomba_x_pos+1
+
+  ; add y velocity to position
+  lda goomba_y_vel
+  clc
+  adc goomba_y_pos
+  sta goomba_y_pos
+  lda goomba_y_vel ; sign extend velocity
+  and #$80
+  bpl :+
+  lda #$FF
+: adc goomba_y_pos+1
+  sta goomba_y_pos+1
+
+  ; check y position for floor
+  lda goomba_y_pos+1
+  and #$0F
+  cmp #$0F
+  beq :+
+  cmp #$0C
+  bmi :+
+  lda #$0C
+  sta goomba_y_pos+1
+  lda #$00
+  sta goomba_y_pos
+  sta goomba_in_air
 :
 
+  ; load goomba position into OAM
   lda goomba_x_pos
-  clc
-  adc goomba_x_vel
-  sta goomba_x_pos
-
-  lda goomba_x_pos
+  ldx goomba_x_pos+1
+  jsr GetPosPixels
   sta $0203
   sta $020B
   clc
@@ -181,16 +268,19 @@ frame_start: ; the main game loop hell yeah
   sta $0207
   sta $020F
   lda goomba_y_pos
+  ldx goomba_y_pos+1
+  jsr GetPosPixels
   sta $0200
   sta $0204
   clc
   adc #$08
   sta $0208
   sta $020C
-  
+
 frame_end:
-  dec frame_complete
-: lda frame_complete
+  inc frame_counter
+  inc processing_complete
+: lda processing_complete
   bne :-
   jmp frame_start
 
