@@ -10,14 +10,19 @@
 frame_counter: .res 1 ; increments each frame
 processing_complete: .res 1 ; 0 if frame hasn't finished processing, 1 if it has
 
-; M = sign, P = pixels, S = subpixels (16 sp/p)
-goomba_x_pos: .res 2 ; 0000PPPP PPPPSSSS
-goomba_y_pos: .res 2 ; 0000PPPP PPPPSSSS
-goomba_x_vel: .res 1 ; MPPP SSSS
-goomba_y_vel: .res 1 ; MPPP SSSS
-goomba_in_air: .res 1
+; PLAYER DATA
+player_x_pos: .res 2
+player_y_pos: .res 2
+player_x_vel: .res 1
+player_x_vel_target: .res 1
+player_y_vel: .res 1
+player_in_air: .res 1
+player_direction: .res 1
 
-; 11111111 11000000
+bullet_count: .res 1
+
+; OBJECT FORMAT
+; 1. %wwhh => w/h + 1 = width/height of object in tiles
 
 controller: .res 1
 
@@ -82,6 +87,7 @@ reset:
   stx $4010 ; disable PCM
   stx frame_counter
   stx processing_complete
+  stx player_direction
 
   bit $2002
 : bit $2002 ; wait for vblank
@@ -158,28 +164,28 @@ reset:
   sta $2001
 
   lda #$01
-  sta goomba_x_pos+1
+  sta player_x_pos+1
   lda #$0C
-  sta goomba_y_pos+1
+  sta player_y_pos+1
   lda #$00
-  sta goomba_x_pos
-  sta goomba_y_pos
+  sta player_x_pos
+  sta player_y_pos
 
 ;; CONSTANTS
-GOOMBA_X_VEL = $28 ; 2.5 px/f
-GOOMBA_JUMP_VEL = -$50 ; 4.0 px/f
-GOOMBA_Y_ACC = $04 ; 0.0625 px/f^2
+PLAYER_X_VEL = $28 ; 2.5 px/f
+PLAYER_JUMP_VEL = -$50 ; 4.0 px/f
+PLAYER_Y_ACC = $04 ; 0.0625 px/f^2
 
+; ORDER:
+;   read controller
+;   handle x velocity
+;   handle jump (y velocity)
+;   handle gravity (y acceleration)
+;   add x/y velocity to respective positions and sign extend
+;   check if y position collides with floor
+;   load positions into OAM
+;   set player direction
 frame_start:
-  lda frame_counter
-  and #$0F ; swap legs every 16 frames
-  bne :+
-  ; swap OAM[9] and OAM[13] (goomba leg positions)
-  lda $0209
-  ldx $020D
-  stx $0209
-  sta $020D
-:
   jsr ReadController
 
   ; handle x velocity
@@ -189,77 +195,81 @@ frame_start:
   beq :+
   txa
   clc
-  adc #GOOMBA_X_VEL
+  adc #PLAYER_X_VEL
   tax
+  lda #$00
+  sta player_direction
 : lda controller
   and #$02 ; left
   beq :+
   txa
   sec
-  sbc #GOOMBA_X_VEL
+  sbc #PLAYER_X_VEL
   tax
+  lda #$01
+  sta player_direction
 :
-  stx goomba_x_vel
+  stx player_x_vel
 
   ; handle jump
-  lda goomba_in_air
+  lda player_in_air
   bne :+
   lda controller
   and #$08 ; up
   beq :+
-  lda #GOOMBA_JUMP_VEL
-  sta goomba_y_vel
-  inc goomba_in_air
+  lda #PLAYER_JUMP_VEL
+  sta player_y_vel
+  inc player_in_air
 :
   ; handle gravity
-  lda goomba_y_vel
+  lda player_y_vel
   clc
-  adc #GOOMBA_Y_ACC
-  bvc :+ ; prohibit velocity from overflowing
+  adc #PLAYER_Y_ACC
+  bvc :+ ; prohibit velocity from overflowing (probably should be seperated from gravity code)
   lda #$7F
-: sta goomba_y_vel
+: sta player_y_vel
 
   ; add x velocity to position
-  lda goomba_x_vel
+  lda player_x_vel
   clc
-  adc goomba_x_pos
-  sta goomba_x_pos
-  lda goomba_x_vel ; sign extend velocity
-  and #$80
+  adc player_x_pos
+  sta player_x_pos
+  lda player_x_vel ; sign extend velocity
+  and #$80 ; if postive then accumulator will be zero
   bpl :+
   lda #$FF
-: adc goomba_x_pos+1
-  sta goomba_x_pos+1
+: adc player_x_pos+1
+  sta player_x_pos+1
 
   ; add y velocity to position
-  lda goomba_y_vel
+  lda player_y_vel
   clc
-  adc goomba_y_pos
-  sta goomba_y_pos
-  lda goomba_y_vel ; sign extend velocity
-  and #$80
+  adc player_y_pos
+  sta player_y_pos
+  lda player_y_vel ; sign extend velocity
+  and #$80 ; if postive then accumulator will be zero
   bpl :+
   lda #$FF
-: adc goomba_y_pos+1
-  sta goomba_y_pos+1
+: adc player_y_pos+1
+  sta player_y_pos+1
 
   ; check y position for floor
-  lda goomba_y_pos+1
+  lda player_y_pos+1
   and #$0F
   cmp #$0F
   beq :+
   cmp #$0C
   bmi :+
   lda #$0C
-  sta goomba_y_pos+1
+  sta player_y_pos+1
   lda #$00
-  sta goomba_y_pos
-  sta goomba_in_air
+  sta player_y_pos
+  sta player_in_air
 :
 
-  ; load goomba position into OAM
-  lda goomba_x_pos
-  ldx goomba_x_pos+1
+  ; load player position into OAM
+  lda player_x_pos
+  ldx player_x_pos+1
   jsr GetPosPixels
   sta $0203
   sta $020B
@@ -267,8 +277,8 @@ frame_start:
   adc #$08
   sta $0207
   sta $020F
-  lda goomba_y_pos
-  ldx goomba_y_pos+1
+  lda player_y_pos
+  ldx player_y_pos+1
   jsr GetPosPixels
   sta $0200
   sta $0204
@@ -276,6 +286,29 @@ frame_start:
   adc #$08
   sta $0208
   sta $020C
+  
+  ; handle player facing
+  lda #$00
+  ldx player_direction
+  beq :+
+  lda #$40
+: sta $0202
+  sta $0206
+  sta $020A
+  sta $020E
+  ; hack to change order of tiles - not scalable
+  lda #$00
+  eor player_direction
+  sta $0201
+  lda #$01
+  eor player_direction
+  sta $0205
+  lda #$10
+  eor player_direction
+  sta $0209
+  lda #$11
+  eor player_direction
+  sta $020D
 
 frame_end:
   inc frame_counter
@@ -287,11 +320,11 @@ frame_end:
 .rodata
 pallete:
   .byte $31,$0F,$16,$36, $00,$00,$00,$00, $00,$00,$00,$00, $00,$00,$00,$00 ; background
-  .byte $31,$0F,$16,$36, $00,$00,$00,$00, $00,$00,$00,$00, $00,$00,$00,$00 ; foreground
+  .byte $31,$0F,$26,$0A, $00,$00,$00,$00, $00,$00,$00,$00, $00,$00,$00,$00 ; foreground
   
 sprite: ; Y, SPRITE #, %VHB000PP, X
-  ; the mario brothers goomba from the game the mario game brothers goomba
-  .byte $C0,$00,$00,$10, $C0,$00,$40,$18, $C8,$01,$00,$10, $C8,$02,$40,$18
+  ; player OAM data
+  .byte $00,$00,$00,$00, $00,$01,$00,$00, $00,$10,$00,$00, $00,$11,$00,$00
   ; beautiful pony
   ; .byte $90,$08,$00,$80, $90,$09,$00,$88, $90,$0A,$00,$90, $90,$0B,$00,$98, $90,$0C,$00,$A0, $90,$0D,$00,$A8, $90,$0E,$00,$B0, $90,$0F,$00,$B8
   ; .byte $98,$18,$00,$80, $98,$19,$00,$88, $98,$1A,$00,$90, $98,$1B,$00,$98, $98,$1C,$00,$A0, $98,$1D,$00,$A8, $98,$1E,$00,$B0, $98,$1F,$00,$B8
